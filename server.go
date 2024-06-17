@@ -15,6 +15,9 @@ import (
 	"time"
 
 	"strconv"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 const (
@@ -24,10 +27,37 @@ const (
 
 	// ServiceType is the dns-sd service type for this service
 	ServiceType = "_nq._tcp"
+
+	quantileError    = 0.05
+	summaryVecMaxAge = 5 * time.Minute
 )
 
 var (
 	buffed []byte
+
+	pC = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: "counters",
+			Name:      "networkQualityd",
+			Help:      "networkQualityd counters",
+		},
+		[]string{"function", "variable", "type"},
+	)
+	pH = promauto.NewSummaryVec(
+		prometheus.SummaryOpts{
+			Subsystem: "histrograms",
+			Name:      "networkQualityd",
+			Help:      "networkQualityd historgrams",
+			Objectives: map[float64]float64{
+				0.1:  quantileError,
+				0.5:  quantileError,
+				0.9:  quantileError,
+				0.99: quantileError,
+			},
+			MaxAge: summaryVecMaxAge,
+		},
+		[]string{"function", "variable", "type"},
+	)
 )
 
 func init() {
@@ -85,6 +115,11 @@ type Server struct {
 }
 
 func (m *Server) PrintStats() {
+	startTime := time.Now()
+	defer func() {
+		pH.WithLabelValues("PrintStats", "complete", "count").Observe(time.Since(startTime).Seconds())
+	}()
+	pC.WithLabelValues("PrintStats", "start", "count").Inc()
 	var lastBytesServed uint64
 	var lastBytesReceived uint64
 	for {
@@ -190,7 +225,13 @@ func (m *Server) generateUploadURL() string {
 }
 
 func (h *handlers) smallHandler(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	defer func() {
+		pH.WithLabelValues("smallHandler", "complete", "count").Observe(time.Since(startTime).Seconds())
+	}()
+	pC.WithLabelValues("smallHandler", r.Method, "count").Inc()
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		pC.WithLabelValues("smallHandler", "StatusMethodNotAllowed", "count").Inc()
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
@@ -203,12 +244,21 @@ func (h *handlers) smallHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.chunkedBodyWriter(w, smallContentLength); !ignorableError(err) {
+		pC.WithLabelValues("smallHandler", "chunkedBodyWriter", "error").Inc()
 		log.Printf("Error writing content of length %d: %s", smallContentLength, err)
 	}
 }
 
 func (h *handlers) largeHandler(w http.ResponseWriter, r *http.Request) {
+
+	startTime := time.Now()
+	defer func() {
+		pH.WithLabelValues("largeHandler", "complete", "count").Observe(time.Since(startTime).Seconds())
+	}()
+	pC.WithLabelValues("largeHandler", r.Method, "count").Inc()
+
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		pC.WithLabelValues("largeHandler", "StatusMethodNotAllowed", "count").Inc()
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
@@ -225,11 +275,19 @@ func (h *handlers) largeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.chunkedBodyWriter(w, largeContentLength); !ignorableError(err) {
+		pC.WithLabelValues("smallHandler", "chunkedBodyWriter", "error").Inc()
 		log.Printf("Error writing content of length %d: %s", largeContentLength, err)
 	}
 }
 
 func (h *handlers) chunkedBodyWriter(w http.ResponseWriter, contentLength int64) error {
+
+	startTime := time.Now()
+	defer func() {
+		pH.WithLabelValues("chunkedBodyWriter", "complete", "count").Observe(time.Since(startTime).Seconds())
+	}()
+	pC.WithLabelValues("chunkedBodyWriter", "start", "count").Inc()
+
 	w.WriteHeader(http.StatusOK)
 
 	n := contentLength
@@ -237,15 +295,19 @@ func (h *handlers) chunkedBodyWriter(w http.ResponseWriter, contentLength int64)
 		if n >= chunkSize {
 			n -= chunkSize
 			atomic.AddUint64(h.BytesServed, uint64(chunkSize))
+			pC.WithLabelValues("chunkedBodyWriter", "chunkSize", "count").Add(float64(chunkSize))
 
 			if _, err := w.Write(buffed); err != nil {
+				pC.WithLabelValues("chunkedBodyWriter", "chunkedWrite", "error").Inc()
 				return err
 			}
 			continue
 		}
 
 		atomic.AddUint64(h.BytesServed, uint64(n))
+		pC.WithLabelValues("chunkedBodyWriter", "n", "count").Add(float64(n))
 		if _, err := w.Write(buffed[:n]); err != nil {
+			pC.WithLabelValues("chunkedBodyWriter", "Write", "error").Inc()
 			return err
 		}
 		break
@@ -265,6 +327,13 @@ func setNoPublicCache(h http.Header) {
 // slurpHandler reads the post request and returns JSON with bytes
 // read and how long it took
 func (h *handlers) slurpHandler(w http.ResponseWriter, r *http.Request) {
+
+	startTime := time.Now()
+	defer func() {
+		pH.WithLabelValues("slurpHandler", "complete", "count").Observe(time.Since(startTime).Seconds())
+	}()
+	pC.WithLabelValues("slurpHandler", "start", "count").Inc()
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	setNoPublicCache(w.Header())
 
@@ -274,6 +343,7 @@ func (h *handlers) slurpHandler(w http.ResponseWriter, r *http.Request) {
 
 	_, err := io.Copy(countingDiscard{byteCounter: h.BytesReceived}, r.Body)
 	if err != nil {
+		pC.WithLabelValues("slurpHandler", "Copy", "error").Inc()
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
